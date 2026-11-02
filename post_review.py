@@ -30,6 +30,27 @@ def render_review(review: Review) -> str:
 
     return "\n\n".join(sections)
 
+def post_review(project_path: str, mr_iid: int, review: Review) -> int:
+    token = os.environ.get("GITLAB_TOKEN", "").strip()
+    if not token:
+        raise ValueError("Please set GITLAB_TOKEN first.")
+
+    project = quote(project_path, safe="")
+    url = (
+        f"https://gitlab.com/api/v4/projects/{project}"
+        f"/merge_requests/{mr_iid}/notes"
+    )
+
+    response = httpx.post(
+        url,
+        headers={"PRIVATE-TOKEN": token},
+        json={"body": render_review(review)},
+        timeout=20,
+    )
+    response.raise_for_status()
+
+    return response.json()["id"]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -48,25 +69,8 @@ def main():
         print("\nPreview only. Add --post to publish this review.")
         return
 
-    token = os.environ.get("GITLAB_TOKEN", "").strip()
-    if not token:
-        raise SystemExit("Please set GITLAB_TOKEN first.")
-
-    project = quote("RETCx/gitlab-ai-reviewer", safe="")
-    url = (
-        f"https://gitlab.com/api/v4/projects/{project}"
-        "/merge_requests/1/notes"
-    )
-
-    response = httpx.post(
-        url,
-        headers={"PRIVATE-TOKEN": token},
-        json={"body": body},
-        timeout=20,
-    )
-    response.raise_for_status()
-
-    print(f"\nPosted successfully. Note ID: {response.json()['id']}")
+    note_id = post_review("RETCx/gitlab-ai-reviewer", 1, review)
+    print(f"\nPosted successfully. Note ID: {note_id}")
 
 
 if __name__ == "__main__":
