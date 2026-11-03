@@ -3,90 +3,73 @@
 A Python proof of concept that reviews GitLab merge requests using an LLM
 and posts structured feedback as a merge request comment.
 
-## Workflow
+## One review, from start to finish
 
-1. GitLab sends a merge request webhook.
-2. FastAPI verifies the webhook signature and timestamp.
-3. A background task checks that the merge request is open.
-4. The service fetches the diff and requests a review from OpenRouter.
-5. Pydantic validates the structured review.
-6. The service checks that the source commit is unchanged before posting.
-7. The review is posted as a GitLab merge request comment.
+Imagine you open GitLab MR `!1` to merge `feat/add-demo-code` into `main`.
+GitLab already stores this MR and shows it on the Merge requests page. Our
+service listens for an event and writes a review comment on that existing MR.
 
-## How the code works
+1. **GitLab tells us about the MR.** GitLab sends an HTTP `POST` to
+   `/webhooks/gitlab`. The JSON body includes the project path, MR number
+   (`iid: 1`), and action (`open` or `update`), among other details. It does
+   **not** contain the full code diff. `run_server.py` starts Uvicorn with
+   `app:app`: the `app` object in `app.py` receives this request.
+2. **`app.py` checks the request.** It verifies the webhook signature with
+   `GITLAB_WEBHOOK_SIGNING_SECRET`, then checks the project and action. If
+   automatic review is enabled, it schedules `run_review(project, 1)` as a
+   background task. It immediately replies `accepted` to GitLab. This means
+   the request was accepted; the review may still fail later.
+3. **`review_job.py` gets the current MR.** `fetch_mr()` sends a `GET` to
+   GitLab's API using `GITLAB_TOKEN`. The response includes the MR's current
+   state and the SHA of the latest commit on its source branch. The job skips
+   a closed MR or a `(project, MR number, SHA)` it already reviewed.
+4. **It gets the code changes.** `fetch_mr_diff()` sends another `GET` to
+   GitLab. GitLab returns changed file paths and patch text: `+` means an
+   added line, `-` a removed line, and `@@` a changed section. Our service
+   joins these patches and skips diffs longer than 40,000 characters. It
+   does not clone either branch locally.
+5. **The LLM reviews that diff.** `review_diff()` sends it to OpenRouter
+   using `OPENROUTER_API_KEY`. `schemas.py` describes the answer:
+   `Review` has a `summary`, `findings: list[Finding]`, and
+   `suggested_tests`. Each `Finding` has a `file` path, `severity`
+   (`low`/`medium`/`high`), `explanation`, and `suggestion`.
 
-### Webhook and API requests
+   For MR `!1`, a short example of the expected JSON is:
 
-`run_server.py` asks for missing credentials and starts Uvicorn with `app:app`:
-the `app` variable in `app.py`. It enables automatic reviews in this local
-launcher. GitLab already stores and displays a merge request when it sends a
-webhook; the webhook tells this service that an event occurred. It does not
-supply the complete code diff to this service.
+   ```json
+   {
+     "summary": "Empty input raises the wrong exception.",
+     "findings": [{
+       "file": "examples/demo_app.py",
+       "severity": "high",
+       "explanation": "average([]) raises ZeroDivisionError, not ValueError.",
+       "suggestion": "Raise ValueError before dividing."
+     }],
+     "suggested_tests": ["Check average([]) raises ValueError."]
+   }
+   ```
 
-| Step | Direction | Code | Purpose |
-| --- | --- | --- | --- |
-| 1 | GitLab POST -> service | `app.py`: `POST /webhooks/gitlab` | Notify the service of a merge request event. |
-| 2 | Service GET -> GitLab API | `review_job.py`: `fetch_mr()` | Read the current MR state and source commit SHA. |
-| 3 | Service GET -> GitLab API | `fetch_diff.py`: `fetch_mr_diff()` | Read the changed files and diff text. |
-| 4 | Service POST -> OpenRouter | `review_diff.py`: `review_diff()` | Ask the LLM for a structured review. |
-| 5 | Service GET -> GitLab API | `review_job.py`: `fetch_mr()` | Check the MR state and SHA again before posting. |
-| 6 | Service POST -> GitLab API | `post_review.py`: `post_review()` | Add a Markdown note to the MR. |
+   `Review.model_json_schema()` tells the LLM which JSON fields to return,
+   including the fields nested inside `Finding`.
+   `Review.model_validate_json(content)` checks the answer afterward.
+   This checks the *shape* of the response; it does not open the reported
+   file or prove that the finding is correct.
 
-In step 1, FastAPI parses the webhook JSON into `MergeRequestEvent`. The
-payload includes more fields than this model uses; the code extracts only the
-project path, MR IID (for example, `!1`), and action. `app.py` verifies the
-signature using the original request body and headers, accepts only the
-configured project and `open`, `reopen`, or `update` actions, and schedules
-`run_review()` when `AUTO_REVIEW_ENABLED=1`. The response status `accepted`
-means the work was scheduled, not that a review was posted.
+6. **It checks and posts.** `fetch_mr()` sends a second `GET` because the MR
+   could have changed while the LLM was working. If the MR is still open and
+   its SHA is unchanged, `post_review()` sends an outgoing `POST` to GitLab's
+   `/notes` API to create a Markdown comment on the MR. Only then does the
+   job add its `(project, MR number, SHA)` key to `completed_reviews`.
 
-The three credentials have distinct roles: `GITLAB_WEBHOOK_SIGNING_SECRET`
-verifies incoming GitLab webhooks; `GITLAB_TOKEN` authenticates outgoing
-GitLab API requests to read MRs/diffs and post notes; `OPENROUTER_API_KEY`
-authenticates the LLM request.
+The `POST` in `@app.post("/webhooks/gitlab")` is **incoming** (GitLab calls
+our service). The `POST` in `post_review()` is **outgoing** (our service calls
+GitLab). `completed_reviews` lives only in this Python process, so it is
+cleared when the service restarts. Failures after `accepted` are logged by
+`run_review()`; they are not sent in the earlier HTTP response.
 
-### Reviewing a commit
-
-`review_job.py` first skips MRs that are no longer open. It stores the source
-commit SHA in a key `(project_path, mr_iid, sha)` and skips a key already in
-`completed_reviews`. `fetch_mr_diff()` asks GitLab for each changed file's
-`new_path` and `diff`. This is patch text: `+` marks added lines, `-` removed
-lines, and `@@` a changed section. No local Git checkout is needed.
-
-After the LLM responds, the second `fetch_mr()` checks whether the MR is still
-open and has the same source SHA. If a new commit was pushed during review,
-the service discards the stale result. This check reduces stale comments but
-cannot make posting atomic with GitLab changes.
-
-### Structured review output
-
-`schemas.py` defines a `Review` with a `summary`, a list of `Finding` objects,
-and a list of `suggested_tests`. One `Finding` contains:
-
-| Field | Meaning |
-| --- | --- |
-| `file` | Path reported by the LLM, such as `examples/demo_app.py`. |
-| `severity` | One of `low`, `medium`, or `high`. |
-| `explanation` | The reported defect and its triggering case. |
-| `suggestion` | A proposed fix. |
-
-`Review.model_json_schema()` in `review_diff.py` produces a JSON Schema for
-the full review, including the nested `Finding` fields, and sends it to
-OpenRouter. `Review.model_validate_json(content)` then validates the returned
-JSON recursively. Pydantic requires the declared fields and types, rejects
-extra fields, and restricts `severity` to the listed values. It does not
-check whether a named file exists or whether a finding is factually correct;
-the field names and system prompt guide the LLM's wording.
-
-`post_review.py` formats the validated review as Markdown and creates a
-top-level MR note. Only after the post succeeds does `review_job.py` add the
-key to `completed_reviews`. That set lives in process memory, so restarting
-the service clears it. A failure in `run_review()` is logged; the earlier
-webhook HTTP response cannot report that later failure.
-
-The command-line demo under `if __name__ == "__main__":` in `review_diff.py`
-runs only when that file is executed directly. Importing and calling
-`review_diff()` from `review_job.py` does not run the demo block.
+When `review_job.py` imports and calls `review_diff()`, Python runs that
+function directly. The demo block under `if __name__ == "__main__":` in
+`review_diff.py` runs only when you execute that file itself.
 
 ## Features
 
