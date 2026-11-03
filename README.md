@@ -13,6 +13,81 @@ and posts structured feedback as a merge request comment.
 6. The service checks that the source commit is unchanged before posting.
 7. The review is posted as a GitLab merge request comment.
 
+## How the code works
+
+### Webhook and API requests
+
+`run_server.py` asks for missing credentials and starts Uvicorn with `app:app`:
+the `app` variable in `app.py`. It enables automatic reviews in this local
+launcher. GitLab already stores and displays a merge request when it sends a
+webhook; the webhook tells this service that an event occurred. It does not
+supply the complete code diff to this service.
+
+| Step | Direction | Code | Purpose |
+| --- | --- | --- | --- |
+| 1 | GitLab POST -> service | `app.py`: `POST /webhooks/gitlab` | Notify the service of a merge request event. |
+| 2 | Service GET -> GitLab API | `review_job.py`: `fetch_mr()` | Read the current MR state and source commit SHA. |
+| 3 | Service GET -> GitLab API | `fetch_diff.py`: `fetch_mr_diff()` | Read the changed files and diff text. |
+| 4 | Service POST -> OpenRouter | `review_diff.py`: `review_diff()` | Ask the LLM for a structured review. |
+| 5 | Service GET -> GitLab API | `review_job.py`: `fetch_mr()` | Check the MR state and SHA again before posting. |
+| 6 | Service POST -> GitLab API | `post_review.py`: `post_review()` | Add a Markdown note to the MR. |
+
+In step 1, FastAPI parses the webhook JSON into `MergeRequestEvent`. The
+payload includes more fields than this model uses; the code extracts only the
+project path, MR IID (for example, `!1`), and action. `app.py` verifies the
+signature using the original request body and headers, accepts only the
+configured project and `open`, `reopen`, or `update` actions, and schedules
+`run_review()` when `AUTO_REVIEW_ENABLED=1`. The response status `accepted`
+means the work was scheduled, not that a review was posted.
+
+The three credentials have distinct roles: `GITLAB_WEBHOOK_SIGNING_SECRET`
+verifies incoming GitLab webhooks; `GITLAB_TOKEN` authenticates outgoing
+GitLab API requests to read MRs/diffs and post notes; `OPENROUTER_API_KEY`
+authenticates the LLM request.
+
+### Reviewing a commit
+
+`review_job.py` first skips MRs that are no longer open. It stores the source
+commit SHA in a key `(project_path, mr_iid, sha)` and skips a key already in
+`completed_reviews`. `fetch_mr_diff()` asks GitLab for each changed file's
+`new_path` and `diff`. This is patch text: `+` marks added lines, `-` removed
+lines, and `@@` a changed section. No local Git checkout is needed.
+
+After the LLM responds, the second `fetch_mr()` checks whether the MR is still
+open and has the same source SHA. If a new commit was pushed during review,
+the service discards the stale result. This check reduces stale comments but
+cannot make posting atomic with GitLab changes.
+
+### Structured review output
+
+`schemas.py` defines a `Review` with a `summary`, a list of `Finding` objects,
+and a list of `suggested_tests`. One `Finding` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `file` | Path reported by the LLM, such as `examples/demo_app.py`. |
+| `severity` | One of `low`, `medium`, or `high`. |
+| `explanation` | The reported defect and its triggering case. |
+| `suggestion` | A proposed fix. |
+
+`Review.model_json_schema()` in `review_diff.py` produces a JSON Schema for
+the full review, including the nested `Finding` fields, and sends it to
+OpenRouter. `Review.model_validate_json(content)` then validates the returned
+JSON recursively. Pydantic requires the declared fields and types, rejects
+extra fields, and restricts `severity` to the listed values. It does not
+check whether a named file exists or whether a finding is factually correct;
+the field names and system prompt guide the LLM's wording.
+
+`post_review.py` formats the validated review as Markdown and creates a
+top-level MR note. Only after the post succeeds does `review_job.py` add the
+key to `completed_reviews`. That set lives in process memory, so restarting
+the service clears it. A failure in `run_review()` is logged; the earlier
+webhook HTTP response cannot report that later failure.
+
+The command-line demo under `if __name__ == "__main__":` in `review_diff.py`
+runs only when that file is executed directly. Importing and calling
+`review_diff()` from `review_job.py` does not run the demo block.
+
 ## Features
 
 - GitLab REST API integration.
