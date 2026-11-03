@@ -1,0 +1,5 @@
+File: examples/demo_app.py
+@@ -0,0 +1,3 @@
++def average(values):
++    """Return the mean. Empty input should raise ValueError."""
++    return sum(values) / len(values)
